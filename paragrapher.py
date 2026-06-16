@@ -77,12 +77,13 @@ def reformat_chunk(chunk, url, model=None):
             {"role": "user", "content": chunk},
         ],
         "temperature": 0.1,
-        "max_tokens": 2048,
+        "max_tokens": 8192,
+        "thinking": {"type": "disabled"},
     }
     if model:
         payload["model"] = model
 
-    response = requests.post(url, json=payload, timeout=120)
+    response = requests.post(url, json=payload, timeout=600)
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"].strip()
 
@@ -121,13 +122,24 @@ def main():
     with open(args.input_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
+    raw_words = len(" ".join(l.strip() for l in lines).split())
+    print(f"  {raw_words:,} words in raw file")
+
     print("Pre-pass: joining broken lines...")
     text = prepass(lines)
-    print(f"  {len(text):,} characters after pre-pass")
+    prepass_words = len(text.split())
+    print(f"  {prepass_words:,} words after pre-pass", end="")
+    if prepass_words != raw_words:
+        print(f" — WARNING: pre-pass lost {raw_words - prepass_words} words")
+    else:
+        print()
 
     print(f"Chunking (target >= {args.chunk_size} chars per chunk)...")
     chunks = chunk_text(text, target=args.chunk_size)
-    print(f"  {len(chunks)} chunks")
+    chunk_words = sum(len(c.split()) for c in chunks)
+    print(f"  {len(chunks)} chunks, {chunk_words:,} words total")
+    if chunk_words != prepass_words:
+        print(f"  WARNING: chunking lost {prepass_words - chunk_words} words")
 
     print(f"Sending to LM Studio ({args.url})...")
     reformatted = []
@@ -135,15 +147,23 @@ def main():
         print(f"  [{i}/{len(chunks)}] {len(chunk)} chars ... ", end="", flush=True)
         try:
             result = reformat_chunk(chunk, url=args.url, model=args.model)
+            result_words = len(result.split())
+            chunk_input_words = len(chunk.split())
+            if result_words != chunk_input_words:
+                print(f"WARNING: input {chunk_input_words} words, output {result_words} words ... ", end="")
             reformatted.append(result)
             print("ok")
         except Exception as e:
             print(f"FAILED ({e}) — keeping original")
             reformatted.append(chunk)
 
-    print(f"Writing {output_path}...")
+    output = "\n\n".join(reformatted)
+    output_words = len(output.split())
+    print(f"Writing {output_path}... ({output_words:,} words)")
+    if output_words != prepass_words:
+        print(f"  WARNING: final output has {prepass_words - output_words} fewer words than pre-pass")
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n\n".join(reformatted))
+        f.write(output)
 
     print("Done.")
 
