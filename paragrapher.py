@@ -32,21 +32,22 @@ def prepass(lines):
     return " ".join(sentences)
 
 
+def split_into_sentences(text):
+    """Split text into sentences on punctuation boundaries."""
+    return [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
+
+
 def chunk_text(text, target=CHUNK_TARGET):
     """Split text into chunks of ~target chars, always ending at a sentence boundary."""
-    sentence_endings = re.compile(r'(?<=[.!?])\s+')
-    sentences = sentence_endings.split(text)
+    sentences = split_into_sentences(text)
 
     chunks = []
     current = []
     current_len = 0
 
     for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
         current.append(sentence)
-        current_len += len(sentence) + 1  # +1 for the space between sentences
+        current_len += len(sentence) + 1
         if current_len >= target:
             chunks.append(" ".join(current))
             current = []
@@ -58,34 +59,59 @@ def chunk_text(text, target=CHUNK_TARGET):
     return chunks
 
 
-def reformat_chunk(chunk, url, model=None):
-    """Send a chunk to LM Studio and return the paragraphed version."""
+def get_break_positions(chunk, url, model=None, debug=False):
+    """Ask the LLM where paragraph breaks should go. Returns a set of 1-indexed
+    sentence numbers after which a break should be inserted."""
+    sentences = split_into_sentences(chunk)
+    if len(sentences) <= 1:
+        return set(), sentences
+
+    numbered = "\n".join(f"{i + 1}: {s}" for i, s in enumerate(sentences))
+
     payload = {
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a text formatter. Your ONLY task is to add paragraph breaks "
-                    "to the provided text to improve readability. Do NOT change any words, "
-                    "do NOT fix spelling, do NOT alter punctuation, do NOT add or remove "
-                    "any content whatsoever. Only insert paragraph breaks (blank lines) "
-                    "where natural breaks in the narrative occur — scene shifts, dialogue "
-                    "turns, or topic changes. Return ONLY the reformatted text with no "
-                    "explanation, preamble, or commentary."
+                    "You are a paragraph formatter. You will receive a numbered list of sentences. "
+                    "Decide where paragraph breaks should go to improve readability — at scene shifts, "
+                    "dialogue turns, or topic changes. "
+                    "Respond with ONLY a comma-separated list of sentence numbers after which a new "
+                    "paragraph should start. Example: 3, 7, 12\n"
+                    "If no breaks are needed, respond with: none\n"
+                    "Output nothing else — no explanation, no commentary."
                 ),
             },
-            {"role": "user", "content": chunk},
+            {"role": "user", "content": numbered},
         ],
         "temperature": 0.1,
-        "max_tokens": 8192,
-        "thinking": {"type": "disabled"},
+        "max_tokens": 1024,
     }
     if model:
         payload["model"] = model
 
-    response = requests.post(url, json=payload, timeout=600)
+    response = requests.post(url, json=payload, timeout=60)
     response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"].strip()
+    raw = response.json()["choices"][0]["message"]["content"].strip()
+    if debug:
+        print(f"\n      RAW: {repr(raw)}")
+
+    # Extract all valid integers from the response (must be 1 to N-1)
+    positions = set(
+        int(n) for n in re.findall(r'\d+', raw)
+        if 1 <= int(n) <= len(sentences) - 1
+    )
+    return positions, sentences
+
+
+def apply_breaks(sentences, break_positions):
+    """Rejoin sentences, inserting paragraph breaks at the specified positions."""
+    parts = []
+    for i, sentence in enumerate(sentences):
+        parts.append(sentence)
+        if i < len(sentences) - 1:
+            parts.append("\n\n" if (i + 1) in break_positions else " ")
+    return "".join(parts)
 
 
 def main():
@@ -108,6 +134,11 @@ def main():
         "--url",
         default=LM_STUDIO_URL,
         help=f"LM Studio chat completions endpoint (default: {LM_STUDIO_URL})",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print the raw LLM response for each chunk",
     )
     args = parser.parse_args()
 
@@ -146,15 +177,13 @@ def main():
     for i, chunk in enumerate(chunks, 1):
         print(f"  [{i}/{len(chunks)}] {len(chunk)} chars ... ", end="", flush=True)
         try:
-            result = reformat_chunk(chunk, url=args.url, model=args.model)
-            result_words = len(result.split())
-            chunk_input_words = len(chunk.split())
-            if result_words != chunk_input_words:
-                print(f"WARNING: input {chunk_input_words} words, output {result_words} words ... ", end="")
+            positions, sentences = get_break_positions(chunk, url=args.url, model=args.model, debug=args.debug)
+            result = apply_breaks(sentences, positions)
             reformatted.append(result)
-            print("ok")
+            breaks_str = ", ".join(str(p) for p in sorted(positions)) if positions else "none"
+            print(f"breaks after: {breaks_str}")
         except Exception as e:
-            print(f"FAILED ({e}) — keeping original")
+            print(f"FAILED ({e}) — no breaks added")
             reformatted.append(chunk)
 
     output = "\n\n".join(reformatted)
