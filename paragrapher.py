@@ -114,43 +114,15 @@ def apply_breaks(sentences, break_positions):
     return "".join(parts)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Reformat a file with proper paragraphs using a local LLM."
-    )
-    parser.add_argument("input_file", help="Path to the input file")
-    parser.add_argument(
-        "--model",
-        default=None,
-        help="LM Studio model identifier (optional; uses whatever is loaded if omitted)",
-    )
-    parser.add_argument(
-        "--chunk-size",
-        type=int,
-        default=CHUNK_TARGET,
-        help=f"Minimum characters per chunk before a split (default: {CHUNK_TARGET})",
-    )
-    parser.add_argument(
-        "--url",
-        default=LM_STUDIO_URL,
-        help=f"LM Studio chat completions endpoint (default: {LM_STUDIO_URL})",
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Print the raw LLM response for each chunk",
-    )
-    args = parser.parse_args()
+def process_file(input_file, args):
+    input_dir = os.path.dirname(os.path.abspath(input_file))
+    filename = os.path.basename(input_file)
+    clean_dir = os.path.join(input_dir, "clean")
+    os.makedirs(clean_dir, exist_ok=True)
+    output_path = os.path.join(clean_dir, filename)
 
-    if not os.path.exists(args.input_file):
-        print(f"Error: file not found: {args.input_file}", file=sys.stderr)
-        sys.exit(1)
-
-    base, ext = os.path.splitext(args.input_file)
-    output_path = base + "_clean" + (ext or ".txt")
-
-    print(f"Reading {args.input_file}...")
-    with open(args.input_file, "r", encoding="utf-8") as f:
+    print(f"Reading {input_file}...")
+    with open(input_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
     raw_words = len(" ".join(l.strip() for l in lines).split())
@@ -195,6 +167,53 @@ def main():
         f.write(output)
 
     print("Done.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Reformat a file with proper paragraphs using a local LLM."
+    )
+    parser.add_argument("input_file", help="Path to the input file or directory")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="LM Studio model identifier (optional; uses whatever is loaded if omitted)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=CHUNK_TARGET,
+        help=f"Minimum characters per chunk before a split (default: {CHUNK_TARGET})",
+    )
+    parser.add_argument(
+        "--url",
+        default=LM_STUDIO_URL,
+        help=f"LM Studio chat completions endpoint (default: {LM_STUDIO_URL})",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print the raw LLM response for each chunk",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.input_file):
+        print(f"Error: file not found: {args.input_file}", file=sys.stderr)
+        sys.exit(1)
+
+    if os.path.isdir(args.input_file):
+        txt_files = sorted(
+            f for f in os.listdir(args.input_file) if f.lower().endswith(".txt")
+        )
+        if not txt_files:
+            print(f"Error: no .txt files found in {args.input_file}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Found {len(txt_files)} .txt file(s) in {args.input_file}")
+        for i, fname in enumerate(txt_files, 1):
+            print(f"\n=== [{i}/{len(txt_files)}] {fname} ===")
+            process_file(os.path.join(args.input_file, fname), args)
+    else:
+        process_file(args.input_file, args)
 
 
 if __name__ == "__main__":
