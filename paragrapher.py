@@ -32,9 +32,25 @@ def prepass(lines):
     return " ".join(sentences)
 
 
+_SPEECH_TAG_RE = re.compile(r'^["\'“‘]?[a-z]')
+
+
 def split_into_sentences(text):
-    """Split text into sentences on punctuation boundaries."""
-    return [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
+    """Split text into sentences on punctuation boundaries.
+
+    Fragments that begin lowercase (e.g. a `"he said."` speech tag left dangling
+    after a `!`/`?` inside dialogue) are merged back into the preceding sentence
+    so a quote is never separated from its attribution.
+    """
+    raw = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
+
+    merged = []
+    for frag in raw:
+        if merged and _SPEECH_TAG_RE.match(frag):
+            merged[-1] = f"{merged[-1]} {frag}"
+        else:
+            merged.append(frag)
+    return merged
 
 
 def chunk_text(text, target=CHUNK_TARGET):
@@ -75,7 +91,22 @@ def get_break_positions(chunk, url, model=None, debug=False):
                 "content": (
                     "You are a paragraph formatter. You will receive a numbered list of sentences. "
                     "Decide where paragraph breaks should go to improve readability — at scene shifts, "
-                    "dialogue turns, or topic changes. "
+                    "dialogue turns, or topic changes.\n"
+                    "\n"
+                    "Dialogue rules (follow strictly):\n"
+                    "- Start a new paragraph every time the speaker changes. Each speaker's turn of "
+                    "dialogue gets its own paragraph.\n"
+                    "- Keep a line of dialogue together with its speech tag (\"he said\", \"she asked\") "
+                    "and with any action beat that belongs to the same character in that moment. Do not "
+                    "break between a quote and its attribution.\n"
+                    "- When narration or an action beat introduces or follows a different character's "
+                    "line, put it in the same paragraph as that character's dialogue, not the previous "
+                    "speaker's.\n"
+                    "- A single character may speak across consecutive sentences; keep those together in "
+                    "one paragraph unless the narration between them clearly shifts focus.\n"
+                    "- Narration that stands on its own between dialogue turns (describing the scene, not "
+                    "a speaker's immediate action) may be its own paragraph.\n"
+                    "\n"
                     "Respond with ONLY a comma-separated list of sentence numbers after which a new "
                     "paragraph should start. Example: 3, 7, 12\n"
                     "If no breaks are needed, respond with: none\n"
