@@ -179,7 +179,45 @@ SYSTEM_PROMPT = (
 )
 
 
-def get_llm_breaks(sentences, forced, url, model=None, debug=False):
+_THINK_RE = re.compile(r'<(think|thought|reasoning)>.*?</\1>', re.DOTALL | re.IGNORECASE)
+_OPEN_THINK_RE = re.compile(r'<(think|thought|reasoning)>.*\Z', re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(raw):
+    """Remove <think>…</think> blocks. An unclosed <think> (the response was
+    truncated mid-reasoning) leaves nothing usable, so drop it entirely."""
+    raw = _THINK_RE.sub("", raw)
+    raw = _OPEN_THINK_RE.sub("", raw)
+    return raw.strip()
+
+
+def parse_break_list(raw, max_valid):
+    """Pull the answer — a comma-separated list of sentence numbers, or 'none' —
+    out of the model's reply. Reads the last line that looks like an answer so
+    stray numbers in any surrounding chatter are ignored."""
+    text = strip_reasoning(raw)
+    if not text:
+        return set()
+
+    for line in reversed(text.splitlines()):
+        line = line.strip().strip(".")
+        if not line:
+            continue
+        if re.fullmatch(r'(?i)none', line):
+            return set()
+        if re.fullmatch(r'[\d\s,]+', line):
+            return set(
+                n for n in (int(x) for x in re.findall(r'\d+', line))
+                if 1 <= n <= max_valid
+            )
+    # Last resort: no clean answer line — scrape the whole (de-reasoned) reply.
+    return set(
+        n for n in (int(x) for x in re.findall(r'\d+', text))
+        if 1 <= n <= max_valid
+    )
+
+
+def get_llm_breaks(sentences, forced, url, model=None, debug=False, think=True):
     """Ask the LLM for paragraph breaks to ADD on top of the pre-pass breaks.
     Returns a set of 1-indexed sentence numbers."""
     if len(sentences) <= 1:
@@ -187,32 +225,36 @@ def get_llm_breaks(sentences, forced, url, model=None, debug=False):
 
     numbered = "\n".join(f"{i + 1}: {s}" for i, s in enumerate(sentences))
     existing = ", ".join(str(n) for n in sorted(forced)) or "none"
+    user_content = f"Paragraph breaks already exist after sentences: {existing}\n\n{numbered}"
+    if not think:
+        user_content += " /no_think"
 
     payload = {
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Paragraph breaks already exist after sentences: {existing}\n\n{numbered}",
-            },
+            {"role": "user", "content": user_content},
         ],
         "temperature": 0.1,
-        "max_tokens": 1024,
+        # A reasoning model needs room for the <think> block *and* the answer;
+        # 1024 truncates mid-reasoning and no answer is ever emitted.
+        "max_tokens": 8192 if think else 1024,
     }
     if model:
         payload["model"] = model
+    if not think:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["reasoning_effort"] = "none"
 
-    response = requests.post(url, json=payload, timeout=60)
+    response = requests.post(url, json=payload, timeout=120)
     response.raise_for_status()
-    raw = response.json()["choices"][0]["message"]["content"].strip()
+    choice = response.json()["choices"][0]
+    raw = (choice["message"].get("content") or "").strip()
     if debug:
         print(f"\n      RAW: {repr(raw)}")
+    if choice.get("finish_reason") == "length":
+        print("      WARNING: response hit the token limit (truncated) ... ", end="")
 
-    # Extract all valid integers from the response (must be 1 to N-1)
-    return set(
-        int(n) for n in re.findall(r'\d+', raw)
-        if 1 <= int(n) <= len(sentences) - 1
-    )
+    return parse_break_list(raw, len(sentences) - 1)
 
 
 def apply_breaks(sentences, break_positions):
@@ -261,7 +303,10 @@ def process_file(input_file, args):
         print(f"  [{i}/{len(chunks)}] {len(chunk)} chars ... ", end="", flush=True)
         sentences, forced = segment_chunk(chunk)
         try:
-            added = get_llm_breaks(sentences, forced, url=args.url, model=args.model, debug=args.debug)
+            added = get_llm_breaks(
+                sentences, forced, url=args.url, model=args.model,
+                debug=args.debug, think=not args.no_think,
+            )
         except Exception as e:
             added = set()
             print(f"LLM failed ({e}) — pre-pass breaks only ... ", end="")
@@ -307,6 +352,12 @@ def main():
         "--debug",
         action="store_true",
         help="Print the raw LLM response for each chunk",
+    )
+    parser.add_argument(
+        "--no-think",
+        action="store_true",
+        help="Ask the model to skip its reasoning phase (faster; needed for some "
+        "reasoning models that otherwise burn the whole token budget thinking)",
     )
     args = parser.parse_args()
 
