@@ -9,111 +9,192 @@ LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 CHUNK_TARGET = 1800
 
 
+OPEN_QUOTES = '"“‘'
+CLOSE_QUOTES = '"”’'
+_TERMINAL_RE = re.compile(r'[.!?][)\]"”’\']*\s*$')
+_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "st", "sr", "jr", "prof", "rev", "gen", "sgt",
+    "lt", "col", "capt", "vs", "etc", "no", "fig", "e.g", "i.e",
+}
+
+
 def prepass(lines):
-    """Join lines that don't end with sentence-terminating punctuation."""
+    """Join hard-wrapped lines back into paragraphs.
+
+    A new paragraph begins on a blank line, or when the previous line ended a
+    sentence and the next line opens with a quotation mark — the near-universal
+    signal that a new speaker is taking the floor. Paragraphs are separated by a
+    blank line in the returned text; everything downstream treats those breaks as
+    fixed.
+    """
+    paragraphs = []
     buffer = []
-    sentences = []
+
+    def flush():
+        if buffer:
+            paragraphs.append(" ".join(buffer))
+            buffer.clear()
 
     for line in lines:
-        stripped = line.strip()
+        stripped = re.sub(r'\s+', ' ', line.strip())
         if not stripped:
-            if buffer:
-                sentences.append(" ".join(buffer))
-                buffer = []
+            flush()
             continue
+        if buffer and stripped[0] in OPEN_QUOTES and _TERMINAL_RE.search(buffer[-1]):
+            flush()
         buffer.append(stripped)
-        if stripped[-1] in '.!?"':
-            sentences.append(" ".join(buffer))
-            buffer = []
 
-    if buffer:
-        sentences.append(" ".join(buffer))
-
-    return " ".join(sentences)
-
-
-_SPEECH_TAG_RE = re.compile(r'^["\'“‘]?[a-z]')
+    flush()
+    return "\n\n".join(paragraphs)
 
 
 def split_into_sentences(text):
-    """Split text into sentences on punctuation boundaries.
+    """Split text into sentences, ignoring '.!?' that fall inside a quotation.
 
-    Fragments that begin lowercase (e.g. a `"he said."` speech tag left dangling
-    after a `!`/`?` inside dialogue) are merged back into the preceding sentence
-    so a quote is never separated from its attribution.
-    """
-    raw = [s for s in re.split(r'(?<=[.!?])\s+', text.strip()) if s]
+    Double quotes (straight or curly) are tracked by parity so a period inside
+    a quoted line — `"Come on in. I didn't realize it was late."` — is not
+    mistaken for a sentence end. A boundary is only taken when the terminator
+    sits outside quotes and is followed by whitespace and a capital, digit, or
+    opening quote (or the end of the text)."""
+    text = text.strip()
+    if not text:
+        return []
 
-    merged = []
-    for frag in raw:
-        if merged and _SPEECH_TAG_RE.match(frag):
-            merged[-1] = f"{merged[-1]} {frag}"
-        else:
-            merged.append(frag)
-    return merged
+    sentences = []
+    start = 0
+    in_quote = False
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+        if ch == '"' or ch in '“”':
+            if ch == '“':
+                in_quote = True
+            elif ch == '”':
+                in_quote = False
+            else:
+                in_quote = not in_quote
+        elif ch in '.!?' and not in_quote:
+            j = i + 1
+            while j < n and text[j] in '.!?' + CLOSE_QUOTES + ")]'":
+                j += 1
+            if j >= n:
+                sentences.append(text[start:j].strip())
+                start = j
+                i = j
+                continue
+            if text[i] == '.':
+                word = re.search(r'(\S+)$', text[start:i])
+                if word and word.group(1).lower().rstrip('.') in _ABBREVIATIONS:
+                    i += 1
+                    continue
+            if text[j].isspace():
+                k = j
+                while k < n and text[k].isspace():
+                    k += 1
+                if k < n and (text[k].isupper() or text[k].isdigit() or text[k] in OPEN_QUOTES):
+                    sentences.append(text[start:j].strip())
+                    start = k
+                    i = k
+                    continue
+        i += 1
+
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return [s for s in sentences if s]
+
+
+def segment_chunk(chunk):
+    """Return (sentences, forced_breaks) for a chunk.
+
+    `forced_breaks` is the set of 1-indexed sentence numbers after which a
+    paragraph break already exists because the pre-pass put one there."""
+    sentences = []
+    forced = set()
+    for para in (p for p in chunk.split("\n\n") if p.strip()):
+        sentences.extend(split_into_sentences(para))
+        forced.add(len(sentences))
+    forced.discard(len(sentences))
+    forced.discard(0)
+    return sentences, forced
 
 
 def chunk_text(text, target=CHUNK_TARGET):
-    """Split text into chunks of ~target chars, always ending at a sentence boundary."""
-    sentences = split_into_sentences(text)
+    """Group whole paragraphs into chunks of ~target chars.
+
+    Paragraph breaks from the pre-pass are never split across chunks."""
+    paragraphs = [p for p in text.split("\n\n") if p.strip()]
 
     chunks = []
     current = []
     current_len = 0
 
-    for sentence in sentences:
-        current.append(sentence)
-        current_len += len(sentence) + 1
+    for para in paragraphs:
+        current.append(para)
+        current_len += len(para) + 2
         if current_len >= target:
-            chunks.append(" ".join(current))
+            chunks.append("\n\n".join(current))
             current = []
             current_len = 0
 
     if current:
-        chunks.append(" ".join(current))
+        chunks.append("\n\n".join(current))
 
     return chunks
 
 
-def get_break_positions(chunk, url, model=None, debug=False):
-    """Ask the LLM where paragraph breaks should go. Returns a set of 1-indexed
-    sentence numbers after which a break should be inserted."""
-    sentences = split_into_sentences(chunk)
+SYSTEM_PROMPT = (
+    "You are a paragraph formatter for prose fiction. You receive a numbered list "
+    "of sentences. Some paragraph breaks are ALREADY in place (you will be told "
+    "which sentence numbers they follow) — these come from the source text's own "
+    "line breaks and are correct. Your job is to add the breaks that are still "
+    "missing.\n"
+    "\n"
+    "Add a break after a sentence when:\n"
+    "- The speaker changes and no break is there yet. Every speaker's turn of "
+    "dialogue is its own paragraph.\n"
+    "- A long run of narration with no dialogue should be split for readability "
+    "(roughly every 3-6 sentences, at a shift in time, place, topic, or focus).\n"
+    "- The narrative moves to a new scene, action, or subject.\n"
+    "\n"
+    "Do NOT add a break when:\n"
+    "- It would separate a line of dialogue from its speech tag (\"he said\", "
+    "\"she asked\") or from the action beat of the character speaking in that "
+    "moment. A quote and its attribution stay in one paragraph.\n"
+    "- The same character keeps speaking across consecutive sentences with no "
+    "change of focus between them.\n"
+    "- An action beat or bit of narration belongs to the speaker of the dialogue "
+    "right next to it — keep it with that dialogue.\n"
+    "\n"
+    "Treat a sentence that starts with an opening quotation mark as a new "
+    "speaker's turn unless it is clearly the same speaker continuing.\n"
+    "\n"
+    "Respond with ONLY a comma-separated list of sentence numbers after which a "
+    "new paragraph should start (the ones you are ADDING; you may also repeat the "
+    "existing ones, it does no harm). Example: 3, 7, 12\n"
+    "If nothing needs to be added, respond with: none\n"
+    "Output nothing else — no explanation, no commentary."
+)
+
+
+def get_llm_breaks(sentences, forced, url, model=None, debug=False):
+    """Ask the LLM for paragraph breaks to ADD on top of the pre-pass breaks.
+    Returns a set of 1-indexed sentence numbers."""
     if len(sentences) <= 1:
-        return set(), sentences
+        return set()
 
     numbered = "\n".join(f"{i + 1}: {s}" for i, s in enumerate(sentences))
+    existing = ", ".join(str(n) for n in sorted(forced)) or "none"
 
     payload = {
         "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
             {
-                "role": "system",
-                "content": (
-                    "You are a paragraph formatter. You will receive a numbered list of sentences. "
-                    "Decide where paragraph breaks should go to improve readability — at scene shifts, "
-                    "dialogue turns, or topic changes.\n"
-                    "\n"
-                    "Dialogue rules (follow strictly):\n"
-                    "- Start a new paragraph every time the speaker changes. Each speaker's turn of "
-                    "dialogue gets its own paragraph.\n"
-                    "- Keep a line of dialogue together with its speech tag (\"he said\", \"she asked\") "
-                    "and with any action beat that belongs to the same character in that moment. Do not "
-                    "break between a quote and its attribution.\n"
-                    "- When narration or an action beat introduces or follows a different character's "
-                    "line, put it in the same paragraph as that character's dialogue, not the previous "
-                    "speaker's.\n"
-                    "- A single character may speak across consecutive sentences; keep those together in "
-                    "one paragraph unless the narration between them clearly shifts focus.\n"
-                    "- Narration that stands on its own between dialogue turns (describing the scene, not "
-                    "a speaker's immediate action) may be its own paragraph.\n"
-                    "\n"
-                    "Respond with ONLY a comma-separated list of sentence numbers after which a new "
-                    "paragraph should start. Example: 3, 7, 12\n"
-                    "If no breaks are needed, respond with: none\n"
-                    "Output nothing else — no explanation, no commentary."
-                ),
+                "role": "user",
+                "content": f"Paragraph breaks already exist after sentences: {existing}\n\n{numbered}",
             },
-            {"role": "user", "content": numbered},
         ],
         "temperature": 0.1,
         "max_tokens": 1024,
@@ -128,11 +209,10 @@ def get_break_positions(chunk, url, model=None, debug=False):
         print(f"\n      RAW: {repr(raw)}")
 
     # Extract all valid integers from the response (must be 1 to N-1)
-    positions = set(
+    return set(
         int(n) for n in re.findall(r'\d+', raw)
         if 1 <= int(n) <= len(sentences) - 1
     )
-    return positions, sentences
 
 
 def apply_breaks(sentences, break_positions):
@@ -179,15 +259,17 @@ def process_file(input_file, args):
     reformatted = []
     for i, chunk in enumerate(chunks, 1):
         print(f"  [{i}/{len(chunks)}] {len(chunk)} chars ... ", end="", flush=True)
+        sentences, forced = segment_chunk(chunk)
         try:
-            positions, sentences = get_break_positions(chunk, url=args.url, model=args.model, debug=args.debug)
-            result = apply_breaks(sentences, positions)
-            reformatted.append(result)
-            breaks_str = ", ".join(str(p) for p in sorted(positions)) if positions else "none"
-            print(f"breaks after: {breaks_str}")
+            added = get_llm_breaks(sentences, forced, url=args.url, model=args.model, debug=args.debug)
         except Exception as e:
-            print(f"FAILED ({e}) — no breaks added")
-            reformatted.append(chunk)
+            added = set()
+            print(f"LLM failed ({e}) — pre-pass breaks only ... ", end="")
+        positions = forced | added
+        reformatted.append(apply_breaks(sentences, positions))
+        pre_str = ", ".join(str(p) for p in sorted(forced)) or "none"
+        add_str = ", ".join(str(p) for p in sorted(added - forced)) or "none"
+        print(f"pre-pass: {pre_str}  |  added: {add_str}")
 
     output = "\n\n".join(reformatted)
     output_words = len(output.split())
