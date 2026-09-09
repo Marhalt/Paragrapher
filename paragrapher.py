@@ -18,6 +18,22 @@ _ABBREVIATIONS = {
 }
 
 
+_LINE_SEPARATORS = ("\r\n", "\r", " ", "", "\x0b", "\x0c")
+
+
+def read_source_lines(path):
+    """Read a text file and split it into lines, tolerating separators other
+    than plain '\\n'. Word processors and ebook tools often use U+2028 (line
+    separator) or U+2029 (paragraph separator); Python's readlines() ignores
+    both, which would hand the pre-pass a few enormous 'lines'."""
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        content = f.read()
+    content = content.replace("\u2029", "\n\n")  # U+2029 paragraph sep -> blank line
+    for sep in _LINE_SEPARATORS:
+        content = content.replace(sep, "\n")
+    return content.split("\n")
+
+
 def prepass(lines):
     """Join hard-wrapped lines back into paragraphs.
 
@@ -121,27 +137,69 @@ def segment_chunk(chunk):
     return sentences, forced
 
 
-def chunk_text(text, target=CHUNK_TARGET):
-    """Group whole paragraphs into chunks of ~target chars.
+_QUOTE_CHARS = set(OPEN_QUOTES) | set(CLOSE_QUOTES)
 
-    Paragraph breaks from the pre-pass are never split across chunks."""
+
+def filter_added_breaks(sentences, added):
+    """The pre-pass owns dialogue paragraphing — it keys off the source's own
+    line breaks, which reliably start a new line for each new speaker. So the
+    LLM is only trusted to split runs of narration: drop any added break that
+    falls right after a sentence containing a quotation mark, which is where the
+    model tends to wrongly fragment one speaker's turn."""
+    return {
+        i for i in added
+        if not (_QUOTE_CHARS & set(sentences[i - 1]))
+    }
+
+
+def chunk_text(text, target=CHUNK_TARGET):
+    """Break the text into chunks of ~target chars for the LLM.
+
+    Each chunk is a dict:
+      text          the chunk's text (may contain "\\n\\n" between whole paragraphs)
+      new_paragraph how to rejoin it to the previous chunk — "\\n\\n" or " "
+      trusted       True when the chunk is made of complete pre-pass paragraphs
+                    (so their breaks are reliable); False when it is a slice of
+                    one oversized paragraph the pre-pass could not divide.
+
+    Whole paragraphs are packed together up to target. A single paragraph larger
+    than a few times target — the sign that the source had no usable paragraph
+    breaks in that stretch — is split on sentence boundaries so it never reaches
+    the model as one giant blob."""
+    oversize = max(target * 3, 6000)
     paragraphs = [p for p in text.split("\n\n") if p.strip()]
 
     chunks = []
     current = []
     current_len = 0
 
-    for para in paragraphs:
-        current.append(para)
-        current_len += len(para) + 2
-        if current_len >= target:
-            chunks.append("\n\n".join(current))
+    def flush_current():
+        nonlocal current, current_len
+        if current:
+            chunks.append({"text": "\n\n".join(current), "new_paragraph": True, "trusted": True})
             current = []
             current_len = 0
 
-    if current:
-        chunks.append("\n\n".join(current))
+    for para in paragraphs:
+        if len(para) > oversize:
+            flush_current()
+            buf, buf_len, first = [], 0, True
+            for sentence in split_into_sentences(para):
+                buf.append(sentence)
+                buf_len += len(sentence) + 1
+                if buf_len >= target:
+                    chunks.append({"text": " ".join(buf), "new_paragraph": first, "trusted": False})
+                    buf, buf_len, first = [], 0, False
+            if buf:
+                chunks.append({"text": " ".join(buf), "new_paragraph": first, "trusted": False})
+            continue
 
+        current.append(para)
+        current_len += len(para) + 2
+        if current_len >= target:
+            flush_current()
+
+    flush_current()
     return chunks
 
 
@@ -170,6 +228,13 @@ SYSTEM_PROMPT = (
     "\n"
     "Treat a sentence that starts with an opening quotation mark as a new "
     "speaker's turn unless it is clearly the same speaker continuing.\n"
+    "\n"
+    "Example — these belong in ONE paragraph, do NOT break between them:\n"
+    "  \"It's mine!\" he said.\n"
+    "  \"I earned it!\" As he said it, he worked his arm free.\n"
+    "because it is one man speaking, plus his own action. A break only comes "
+    "when a different person speaks — e.g. before \"It's not yours!\" replied "
+    "Steven.\n"
     "\n"
     "Respond with ONLY a comma-separated list of sentence numbers after which a "
     "new paragraph should start (the ones you are ADDING; you may also repeat the "
@@ -275,8 +340,7 @@ def process_file(input_file, args):
     output_path = os.path.join(clean_dir, filename)
 
     print(f"Reading {input_file}...")
-    with open(input_file, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    lines = read_source_lines(input_file)
 
     raw_words = len(" ".join(l.strip() for l in lines).split())
     print(f"  {raw_words:,} words in raw file")
@@ -292,16 +356,20 @@ def process_file(input_file, args):
 
     print(f"Chunking (target >= {args.chunk_size} chars per chunk)...")
     chunks = chunk_text(text, target=args.chunk_size)
-    chunk_words = sum(len(c.split()) for c in chunks)
+    chunk_words = sum(len(c["text"].split()) for c in chunks)
+    split_paras = sum(1 for c in chunks if not c["trusted"])
     print(f"  {len(chunks)} chunks, {chunk_words:,} words total")
+    if split_paras:
+        print(f"  note: {split_paras} chunk(s) are slices of oversized paragraphs "
+              "(source had no usable paragraph breaks there) — LLM will paragraph them freely")
     if chunk_words != prepass_words:
         print(f"  WARNING: chunking lost {prepass_words - chunk_words} words")
 
     print(f"Sending to LM Studio ({args.url})...")
-    reformatted = []
+    pieces = []
     for i, chunk in enumerate(chunks, 1):
-        print(f"  [{i}/{len(chunks)}] {len(chunk)} chars ... ", end="", flush=True)
-        sentences, forced = segment_chunk(chunk)
+        print(f"  [{i}/{len(chunks)}] {len(chunk['text'])} chars ... ", end="", flush=True)
+        sentences, forced = segment_chunk(chunk["text"])
         try:
             added = get_llm_breaks(
                 sentences, forced, url=args.url, model=args.model,
@@ -310,13 +378,18 @@ def process_file(input_file, args):
         except Exception as e:
             added = set()
             print(f"LLM failed ({e}) — pre-pass breaks only ... ", end="")
+        if chunk["trusted"]:
+            added = filter_added_breaks(sentences, added)
+        added -= forced
         positions = forced | added
-        reformatted.append(apply_breaks(sentences, positions))
+        piece = apply_breaks(sentences, positions)
+        joiner = "" if i == 1 else ("\n\n" if chunk["new_paragraph"] else " ")
+        pieces.append(joiner + piece)
         pre_str = ", ".join(str(p) for p in sorted(forced)) or "none"
-        add_str = ", ".join(str(p) for p in sorted(added - forced)) or "none"
+        add_str = ", ".join(str(p) for p in sorted(added)) or "none"
         print(f"pre-pass: {pre_str}  |  added: {add_str}")
 
-    output = "\n\n".join(reformatted)
+    output = "".join(pieces)
     output_words = len(output.split())
     print(f"Writing {output_path}... ({output_words:,} words)")
     if output_words != prepass_words:
