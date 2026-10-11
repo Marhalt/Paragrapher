@@ -11,7 +11,7 @@ CHUNK_TARGET = 1800
 
 OPEN_QUOTES = '"“‘'
 CLOSE_QUOTES = '"”’'
-_TERMINAL_RE = re.compile(r'[.!?][)\]"”’\']*\s*$')
+_TERMINAL_RE = re.compile(r'[.!?…—–][)\]"”’\']*\s*$')
 _ABBREVIATIONS = {
     "mr", "mrs", "ms", "dr", "st", "sr", "jr", "prof", "rev", "gen", "sgt",
     "lt", "col", "capt", "vs", "etc", "no", "fig", "e.g", "i.e",
@@ -37,11 +37,16 @@ def read_source_lines(path):
 def prepass(lines):
     """Join hard-wrapped lines back into paragraphs.
 
-    A new paragraph begins on a blank line, or when the previous line ended a
-    sentence and the next line opens with a quotation mark — the near-universal
-    signal that a new speaker is taking the floor. Paragraphs are separated by a
-    blank line in the returned text; everything downstream treats those breaks as
-    fixed.
+    A new paragraph begins on a blank line that follows a finished sentence, or
+    when the previous line ended a sentence and the next line opens with a
+    quotation mark — the near-universal signal that a new speaker is taking the
+    floor. Paragraphs are separated by a blank line in the returned text;
+    everything downstream treats those breaks as fixed.
+
+    A blank line that lands mid-sentence (the previous line doesn't end with
+    sentence-terminating punctuation) is treated as an extraction artifact —
+    common at page boundaries in PDF/OCR text — rather than a real paragraph
+    break, and is skipped instead of splitting the sentence in two.
     """
     paragraphs = []
     buffer = []
@@ -54,6 +59,8 @@ def prepass(lines):
     for line in lines:
         stripped = re.sub(r'\s+', ' ', line.strip())
         if not stripped:
+            if buffer and not _TERMINAL_RE.search(buffer[-1]):
+                continue  # mid-sentence blank line (likely an extraction artifact) — ignore it
             flush()
             continue
         if buffer and stripped[0] in OPEN_QUOTES and _TERMINAL_RE.search(buffer[-1]):
