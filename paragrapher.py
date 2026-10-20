@@ -16,6 +16,9 @@ _ABBREVIATIONS = {
     "mr", "mrs", "ms", "dr", "st", "sr", "jr", "prof", "rev", "gen", "sgt",
     "lt", "col", "capt", "vs", "etc", "no", "fig", "e.g", "i.e",
 }
+# A quotation left "open" longer than this (chars) is almost certainly an
+# unmatched quote mark rather than one very long unbroken line of dialogue.
+_MAX_QUOTE_SPAN = 400
 
 
 _LINE_SEPARATORS = ("\r\n", "\r", " ", "", "\x0b", "\x0c")
@@ -86,19 +89,35 @@ def split_into_sentences(text):
     sentences = []
     start = 0
     in_quote = False
+    quote_start = 0
     i = 0
     n = len(text)
 
     while i < n:
         ch = text[i]
         if ch == '"' or ch in '“”':
-            if ch == '“':
+            is_measurement = ch == '"' and i > 0 and text[i - 1].isdigit()
+            if is_measurement:
+                pass  # 6", 5'10" etc. -- not a quotation mark at all
+            elif ch == '“':
                 in_quote = True
+                quote_start = i
             elif ch == '”':
                 in_quote = False
             else:
                 in_quote = not in_quote
-        elif ch in '.!?' and not in_quote:
+                if in_quote:
+                    quote_start = i
+        elif in_quote and (i - quote_start) > _MAX_QUOTE_SPAN:
+            # An unmatched quote mark (a stray character, an OCR glitch, a
+            # nested quote someone forgot to close) would otherwise lock
+            # in_quote on for the rest of the paragraph, and every subsequent
+            # sentence boundary would be silently swallowed. No real line of
+            # dialogue runs this long unclosed, so give up tracking it and
+            # let sentence-splitting resume normally.
+            in_quote = False
+
+        if ch in '.!?' and not in_quote:
             j = i + 1
             while j < n and text[j] in '.!?' + CLOSE_QUOTES + ")]'":
                 j += 1
@@ -127,6 +146,59 @@ def split_into_sentences(text):
     if tail:
         sentences.append(tail)
     return [s for s in sentences if s]
+
+
+# A stretch longer than this with no sentence-terminating punctuation at all is
+# almost certainly a heavily comma-spliced run-on (some authors write entire
+# scenes that way), not one real long sentence -- real dialogue/narration
+# sentences essentially never run this long unbroken.
+_LONG_RUN_THRESHOLD = 400
+
+
+def has_run_on(text, threshold=_LONG_RUN_THRESHOLD):
+    """True if `text` contains a stretch of more than `threshold` characters
+    with no '.', '!', '?', '…', or dash at all -- i.e. split_into_sentences has
+    no real sentence boundary to find there. Such text gets a different,
+    cruder treatment (see get_llm_reformat) rather than being chopped into fake
+    "sentences" at comma boundaries: feeding the LLM a numbered list of
+    comma-fragments and asking it to pick break positions made it apply its
+    normal per-sentence pacing to clause fragments, producing a one-line,
+    comma-ending paragraph every few words."""
+    last_end = 0
+    for m in re.finditer(r'[.!?…—–]', text):
+        if m.start() - last_end > threshold:
+            return True
+        last_end = m.end()
+    return len(text) - last_end > threshold
+
+
+def _chunk_raw(text, target):
+    """Cut text with no usable sentence punctuation into ~target-char pieces,
+    for sizing purposes only -- these pieces are never numbered and offered to
+    the LLM as a choice of break positions (see get_llm_reformat instead)."""
+    parts = [p for p in re.split(r'(?<=,)\s+', text) if p] or [text]
+    if len(parts) == 1:
+        words = text.split(" ")
+        parts, buf, buf_len = [], [], 0
+        for word in words:
+            buf.append(word)
+            buf_len += len(word) + 1
+            if buf_len >= target:
+                parts.append(" ".join(buf))
+                buf, buf_len = [], 0
+        if buf:
+            parts.append(" ".join(buf))
+
+    chunks, current, current_len = [], [], 0
+    for part in parts:
+        current.append(part)
+        current_len += len(part) + 1
+        if current_len >= target:
+            chunks.append(" ".join(current))
+            current, current_len = [], 0
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
 
 
 def segment_chunk(chunk):
@@ -168,11 +240,16 @@ def chunk_text(text, target=CHUNK_TARGET):
       trusted       True when the chunk is made of complete pre-pass paragraphs
                     (so their breaks are reliable); False when it is a slice of
                     one oversized paragraph the pre-pass could not divide.
+      mode          "sentence" — normal prose; segmented into real sentences and
+                    the LLM picks which boundaries become paragraph breaks.
+                    "raw" — a run-on stretch with no usable sentence punctuation;
+                    handled by get_llm_reformat instead (see process_file).
 
-    Whole paragraphs are packed together up to target. A single paragraph larger
-    than a few times target — the sign that the source had no usable paragraph
-    breaks in that stretch — is split on sentence boundaries so it never reaches
-    the model as one giant blob."""
+    Whole paragraphs are packed together up to target. A paragraph containing a
+    run-on stretch (see has_run_on) — the sign the source has no usable sentence
+    or paragraph breaks there — is cut to size on comma/word boundaries instead
+    and marked "raw", since there's no sentence structure to offer the LLM a
+    choice of break positions with."""
     oversize = max(target * 3, 6000)
     paragraphs = [p for p in text.split("\n\n") if p.strip()]
 
@@ -183,22 +260,21 @@ def chunk_text(text, target=CHUNK_TARGET):
     def flush_current():
         nonlocal current, current_len
         if current:
-            chunks.append({"text": "\n\n".join(current), "new_paragraph": True, "trusted": True})
+            chunks.append({
+                "text": "\n\n".join(current), "new_paragraph": True,
+                "trusted": True, "mode": "sentence",
+            })
             current = []
             current_len = 0
 
     for para in paragraphs:
-        if len(para) > oversize:
+        if len(para) > oversize or has_run_on(para):
             flush_current()
-            buf, buf_len, first = [], 0, True
-            for sentence in split_into_sentences(para):
-                buf.append(sentence)
-                buf_len += len(sentence) + 1
-                if buf_len >= target:
-                    chunks.append({"text": " ".join(buf), "new_paragraph": first, "trusted": False})
-                    buf, buf_len, first = [], 0, False
-            if buf:
-                chunks.append({"text": " ".join(buf), "new_paragraph": first, "trusted": False})
+            for k, piece in enumerate(_chunk_raw(para, target)):
+                chunks.append({
+                    "text": piece, "new_paragraph": (k == 0),
+                    "trusted": False, "mode": "raw",
+                })
             continue
 
         current.append(para)
@@ -329,6 +405,58 @@ def get_llm_breaks(sentences, forced, url, model=None, debug=False, think=True):
     return parse_break_list(raw, len(sentences) - 1)
 
 
+RAW_SYSTEM_PROMPT = (
+    "You are given a passage of prose fiction that has little or no normal "
+    "sentence punctuation — clauses are strung together with commas instead of "
+    "periods. Your ONLY task is to insert paragraph breaks where they improve "
+    "readability: at a change of speaker in dialogue, or a natural shift in the "
+    "narrative.\n"
+    "\n"
+    "Reproduce the passage EXACTLY as given — the same words, in the same order, "
+    "with the same spelling and punctuation. Do not fix grammar, do not add or "
+    "remove any words, do not rewrite anything. The ONLY change you may make is "
+    "inserting a blank line (two newlines) between paragraphs.\n"
+    "\n"
+    "Output ONLY the reformatted passage — no explanation, no commentary."
+)
+
+
+def get_llm_reformat(text, url, model=None, debug=False, think=True):
+    """For a run-on stretch with no sentence structure to offer the LLM a choice
+    of break positions in, ask it to insert paragraph breaks directly into the
+    raw text instead. Verified the same way the rest of this program verifies
+    LLM output: by word count. A mismatch means the model dropped, added, or
+    rewrote something, so the original text is returned unchanged rather than
+    risking silently corrupted prose."""
+    user_content = text + ("\n\n/no_think" if not think else "")
+
+    payload = {
+        "messages": [
+            {"role": "system", "content": RAW_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 8192 if think else 2048,
+    }
+    if model:
+        payload["model"] = model
+    if not think:
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+        payload["reasoning_effort"] = "none"
+
+    response = requests.post(url, json=payload, timeout=120)
+    response.raise_for_status()
+    choice = response.json()["choices"][0]
+    raw = (choice["message"].get("content") or "").strip()
+    if debug:
+        print(f"\n      RAW: {repr(raw)}")
+
+    result = strip_reasoning(raw)
+    if not result or len(result.split()) != len(text.split()):
+        return text, False
+    return result, True
+
+
 def apply_breaks(sentences, break_positions):
     """Rejoin sentences, inserting paragraph breaks at the specified positions."""
     parts = []
@@ -364,11 +492,11 @@ def process_file(input_file, args):
     print(f"Chunking (target >= {args.chunk_size} chars per chunk)...")
     chunks = chunk_text(text, target=args.chunk_size)
     chunk_words = sum(len(c["text"].split()) for c in chunks)
-    split_paras = sum(1 for c in chunks if not c["trusted"])
+    raw_chunks = sum(1 for c in chunks if c["mode"] == "raw")
     print(f"  {len(chunks)} chunks, {chunk_words:,} words total")
-    if split_paras:
-        print(f"  note: {split_paras} chunk(s) are slices of oversized paragraphs "
-              "(source had no usable paragraph breaks there) — LLM will paragraph them freely")
+    if raw_chunks:
+        print(f"  note: {raw_chunks} chunk(s) are run-on prose with no usable sentence "
+              "punctuation — handled by direct LLM reformatting instead")
     if chunk_words != prepass_words:
         print(f"  WARNING: chunking lost {prepass_words - chunk_words} words")
 
@@ -376,6 +504,21 @@ def process_file(input_file, args):
     pieces = []
     for i, chunk in enumerate(chunks, 1):
         print(f"  [{i}/{len(chunks)}] {len(chunk['text'])} chars ... ", end="", flush=True)
+        joiner = "" if i == 1 else ("\n\n" if chunk["new_paragraph"] else " ")
+
+        if chunk["mode"] == "raw":
+            try:
+                piece, verified = get_llm_reformat(
+                    chunk["text"], url=args.url, model=args.model,
+                    debug=args.debug, think=not args.no_think,
+                )
+            except Exception as e:
+                piece, verified = chunk["text"], False
+                print(f"LLM failed ({e}) — ", end="")
+            pieces.append(joiner + piece)
+            print("reformatted" if verified else "kept as-is (failed word-count check)")
+            continue
+
         sentences, forced = segment_chunk(chunk["text"])
         try:
             added = get_llm_breaks(
@@ -390,7 +533,6 @@ def process_file(input_file, args):
         added -= forced
         positions = forced | added
         piece = apply_breaks(sentences, positions)
-        joiner = "" if i == 1 else ("\n\n" if chunk["new_paragraph"] else " ")
         pieces.append(joiner + piece)
         pre_str = ", ".join(str(p) for p in sorted(forced)) or "none"
         add_str = ", ".join(str(p) for p in sorted(added)) or "none"
